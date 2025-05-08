@@ -10,21 +10,21 @@ class LSTMCell:
             input_size: Dimension of input vector
             hidden_size: Dimension of hidden state
         """
-        # Initialize weights and biases for gates
+        # Initialize weights and biases for gates with smaller values
         # Weights for input gate
-        self.Wi = np.random.randn(hidden_size, input_size + hidden_size) * 0.01
+        self.Wi = np.random.randn(hidden_size, input_size + hidden_size) * 0.02
         self.bi = np.zeros((hidden_size, 1))
         
         # Weights for forget gate
-        self.Wf = np.random.randn(hidden_size, input_size + hidden_size) * 0.01
+        self.Wf = np.random.randn(hidden_size, input_size + hidden_size) * 0.02
         self.bf = np.zeros((hidden_size, 1))
         
         # Weights for output gate
-        self.Wo = np.random.randn(hidden_size, input_size + hidden_size) * 0.01
+        self.Wo = np.random.randn(hidden_size, input_size + hidden_size) * 0.02
         self.bo = np.zeros((hidden_size, 1))
         
         # Weights for cell state
-        self.Wc = np.random.randn(hidden_size, input_size + hidden_size) * 0.01
+        self.Wc = np.random.randn(hidden_size, input_size + hidden_size) * 0.02
         self.bc = np.zeros((hidden_size, 1))
         
         self.hidden_size = hidden_size
@@ -119,7 +119,7 @@ class LSTMCell:
         do = self.tanh(c_next) * dh_next
         do_input = self.sigmoid_derivative(o) * do
         dW['Wo'] += np.dot(do_input, concat.T)
-        dW['bo'] += do_input
+        dW['bo'] += np.sum(do_input, axis=1, keepdims=True)
         
         # Gradient of loss with respect to cell state
         dc = o * self.tanh_derivative(self.tanh(c_next)) * dh_next + dc_next
@@ -128,19 +128,19 @@ class LSTMCell:
         di = c_tilde * dc
         di_input = self.sigmoid_derivative(i) * di
         dW['Wi'] += np.dot(di_input, concat.T)
-        dW['bi'] += di_input
+        dW['bi'] += np.sum(di_input, axis=1, keepdims=True)
         
         # Gradient of loss with respect to forget gate
         df = c_prev * dc
         df_input = self.sigmoid_derivative(f) * df
         dW['Wf'] += np.dot(df_input, concat.T)
-        dW['bf'] += df_input
+        dW['bf'] += np.sum(df_input, axis=1, keepdims=True)
         
         # Gradient of loss with respect to candidate cell state
         dc_tilde = i * dc
         dc_tilde_input = self.tanh_derivative(c_tilde) * dc_tilde
         dW['Wc'] += np.dot(dc_tilde_input, concat.T)
-        dW['bc'] += dc_tilde_input
+        dW['bc'] += np.sum(dc_tilde_input, axis=1, keepdims=True)
         
         # Gradient of loss with respect to concatenated input
         dconcat = (np.dot(self.Wo.T, do_input) +
@@ -158,7 +158,7 @@ class LSTMCell:
         return dx, dh_prev, dc_prev, dW
 
 class LSTM:
-    def __init__(self, input_size, hidden_size, output_size=2):
+    def __init__(self, input_size, hidden_size, output_size=2, prediction_steps=5):
         """
         Initialize LSTM network
         
@@ -166,14 +166,19 @@ class LSTM:
             input_size: Dimension of input vector
             hidden_size: Dimension of hidden state
             output_size: Dimension of output (default=2 for x,y coordinates)
+            prediction_steps: Number of future steps to predict
         """
         self.cell = LSTMCell(input_size, hidden_size)
         self.hidden_size = hidden_size
         self.output_size = output_size
+        self.prediction_steps = prediction_steps
         
-        # Output layer weights
-        self.Wy = np.random.randn(output_size, hidden_size) * 0.01
+        # Output layer weights with smaller initialization
+        self.Wy = np.random.randn(output_size, hidden_size) * 0.02
         self.by = np.zeros((output_size, 1))
+        
+        # Gradient clipping threshold
+        self.clip_threshold = 1.0
         
     def forward(self, x, h0=None, c0=None):
         """
@@ -187,7 +192,7 @@ class LSTM:
         Returns:
             h: Hidden states for all timesteps
             c: Cell states for all timesteps
-            y: Output predictions
+            y: Output predictions for prediction_steps
             cache: Values needed for backward pass
         """
         # Get dimensions
@@ -202,7 +207,7 @@ class LSTM:
         # Initialize output arrays
         h = np.zeros((seq_len, self.hidden_size, batch_size))
         c = np.zeros((seq_len, self.hidden_size, batch_size))
-        y = np.zeros((seq_len, self.output_size, batch_size))
+        y = np.zeros((self.prediction_steps, self.output_size, batch_size))
         
         # Initialize cache list
         cache = []
@@ -218,9 +223,6 @@ class LSTM:
             # Forward step
             h_next, c_next, step_cache = self.cell.forward_step(xt, h_prev, c_prev)
             
-            # Compute output
-            y[t] = np.dot(self.Wy, h_next) + self.by
-            
             # Store outputs
             h[t] = h_next
             c[t] = c_next
@@ -232,6 +234,11 @@ class LSTM:
             # Store cache
             cache.append(step_cache)
             
+            # Only compute predictions for the last prediction_steps
+            if t >= seq_len - self.prediction_steps:
+                pred_idx = t - (seq_len - self.prediction_steps)
+                y[pred_idx] = np.dot(self.Wy, h_next) + self.by
+            
         return h, c, y, cache
     
     def backward(self, x, y, y_pred, cache):
@@ -240,8 +247,8 @@ class LSTM:
         
         Args:
             x: Input sequence (sequence_length, input_size, batch_size)
-            y: True output sequence (sequence_length, output_size, batch_size)
-            y_pred: Predicted output sequence (sequence_length, output_size, batch_size)
+            y: True output sequence (prediction_steps, output_size, batch_size)
+            y_pred: Predicted output sequence (prediction_steps, output_size, batch_size)
             cache: Values from forward pass
             
         Returns:
@@ -269,15 +276,20 @@ class LSTM:
         
         # Backward pass through time
         for t in reversed(range(seq_len)):
-            # Gradient of loss with respect to output
-            dy = y_pred[t] - y[t]
-            
-            # Gradient of loss with respect to output layer weights
-            gradients['Wy'] += np.dot(dy, cache[t][4].T)  # cache[t][4] is h_next
-            gradients['by'] += np.sum(dy, axis=1, keepdims=True)
-            
-            # Gradient of loss with respect to hidden state
-            dh = np.dot(self.Wy.T, dy) + dh_next
+            # Only compute gradients for the prediction steps
+            if t >= seq_len - self.prediction_steps:
+                pred_idx = t - (seq_len - self.prediction_steps)
+                # Gradient of loss with respect to output
+                dy = y_pred[pred_idx] - y[pred_idx]
+                
+                # Gradient of loss with respect to output layer weights
+                gradients['Wy'] += np.dot(dy, cache[t][4].T)  # cache[t][4] is h_next
+                gradients['by'] += np.sum(dy, axis=1, keepdims=True)
+                
+                # Gradient of loss with respect to hidden state
+                dh = np.dot(self.Wy.T, dy) + dh_next
+            else:
+                dh = dh_next
             
             # Backward step
             dx, dh_next, dc_next, dW = self.cell.backward_step(dh, dc_next, cache[t])
@@ -290,12 +302,16 @@ class LSTM:
     
     def update_parameters(self, gradients, learning_rate):
         """
-        Update network parameters using gradients
+        Update network parameters using gradients with clipping
         
         Args:
             gradients: Dictionary containing gradients of all parameters
             learning_rate: Learning rate for gradient descent
         """
+        # Clip gradients
+        for key in gradients:
+            np.clip(gradients[key], -self.clip_threshold, self.clip_threshold, out=gradients[key])
+        
         # Update output layer weights
         self.Wy -= learning_rate * gradients['Wy']
         self.by -= learning_rate * gradients['by']
@@ -311,12 +327,12 @@ class LSTM:
         self.cell.bc -= learning_rate * gradients['bc']
     
     def compute_loss(self, y_pred, y_true):
-        """Compute mean squared error loss"""
-        return np.mean((y_pred - y_true) ** 2)
+        """Compute root mean squared error (RMSE) loss"""
+        return np.sqrt(np.mean((y_pred - y_true) ** 2))
     
     def compute_rmse(self, y_pred, y_true):
-        """Compute root mean squared error (RMSE)"""
-        return np.sqrt(np.mean((y_pred - y_true) ** 2))
+        """Compute root mean squared error (RMSE) - kept for backward compatibility"""
+        return self.compute_loss(y_pred, y_true)
     
     def train_step(self, x, y_true, learning_rate=0.01):
         """
@@ -324,11 +340,11 @@ class LSTM:
         
         Args:
             x: Input sequence (sequence_length, input_size, batch_size)
-            y_true: True output sequence (sequence_length, output_size, batch_size)
+            y_true: True output sequence (prediction_steps, output_size, batch_size)
             learning_rate: Learning rate for gradient descent
             
         Returns:
-            loss: Mean squared error loss
+            loss: RMSE loss
         """
         # Forward pass
         _, _, y_pred, cache = self.forward(x)
@@ -376,23 +392,20 @@ def train_model(model, data_loader, num_epochs=10, batch_size=32, learning_rate=
     
     for epoch in range(num_epochs):
         # Shuffle training data
-        indices = np.random.permutation(len(X_train))
-        X_train = X_train[indices]
-        y_train = y_train[indices]
+        batch_size = X_train.shape[2]  # Get actual batch size from the transposed data
+        indices = np.random.permutation(batch_size)
+        X_train = X_train[:, :, indices]
+        y_train = y_train[:, :, indices]
         
         total_loss = 0
-        num_batches = len(X_train) // batch_size
+        num_batches = batch_size // batch_size  # This will be 1 since we're using full batch
         
         for i in range(num_batches):
             # Get batch
             start_idx = i * batch_size
             end_idx = start_idx + batch_size
-            x_batch = X_train[start_idx:end_idx]
-            y_batch = y_train[start_idx:end_idx]
-            
-            # Reshape for LSTM input
-            x_batch = x_batch.transpose(1, 2, 0)  # (seq_len, input_size, batch_size)
-            y_batch = y_batch.transpose(1, 2, 0)  # (seq_len, output_size, batch_size)
+            x_batch = X_train[:, :, start_idx:end_idx]
+            y_batch = y_train[:, :, start_idx:end_idx]
             
             # Training step
             loss = model.train_step(x_batch, y_batch, learning_rate)
@@ -400,15 +413,18 @@ def train_model(model, data_loader, num_epochs=10, batch_size=32, learning_rate=
             
         # Print epoch statistics
         avg_loss = total_loss / num_batches
-        print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.6f}")
+        print(f"Epoch {epoch+1}/{num_epochs}, Average RMSE: {avg_loss:.6f}")
         
         # Evaluate on validation set
-        x_val = X_val.transpose(1, 2, 0)
-        y_val = y_val.transpose(1, 2, 0)
+        x_val = X_val[:, :, :batch_size]
+        y_val = y_val[:, :, :batch_size]
         _, _, y_pred_val, _ = model.forward(x_val)
-        val_loss = model.compute_loss(y_pred_val, y_val)
-        val_rmse = model.compute_rmse(y_pred_val, y_val)
-        print(f"Validation Loss: {val_loss:.6f}, Validation RMSE: {val_rmse:.6f}")
+        
+        # Convert predictions back to original scale for RMSE calculation
+        y_pred_val_original = data_loader.inverse_transform_predictions(y_pred_val)
+        y_val_original = data_loader.inverse_transform_predictions(y_val)
+        val_loss = model.compute_loss(y_pred_val_original, y_val_original)
+        print(f"Validation RMSE: {val_loss:.6f}")
         
         # Save model if it's the best so far
         checkpoint.save_model(model, val_loss, epoch)
@@ -425,16 +441,19 @@ def train_model(model, data_loader, num_epochs=10, batch_size=32, learning_rate=
     visualizer.plot_metrics(os.path.join(save_path, 'training_metrics.png'))
     
     # Evaluate on test set and plot predictions
-    x_test = X_test.transpose(1, 2, 0)
-    y_test = y_test.transpose(1, 2, 0)
+    x_test = X_test[:, :, :batch_size]
+    y_test = y_test[:, :, :batch_size]
     _, _, y_pred_test, _ = model.forward(x_test)
-    test_loss = model.compute_loss(y_pred_test, y_test)
-    test_rmse = model.compute_rmse(y_pred_test, y_test)
-    print(f"\nTest Loss: {test_loss:.6f}, Test RMSE: {test_rmse:.6f}")
+    
+    # Convert predictions back to original scale for final evaluation
+    y_pred_test_original = data_loader.inverse_transform_predictions(y_pred_test)
+    y_test_original = data_loader.inverse_transform_predictions(y_test)
+    test_loss = model.compute_loss(y_pred_test_original, y_test_original)
+    print(f"\nTest RMSE: {test_loss:.6f}")
     
     # Plot predictions
-    visualizer.plot_predictions(y_test.transpose(1, 0, 2), 
-                              y_pred_test.transpose(1, 0, 2),
+    visualizer.plot_predictions(y_test_original.transpose(1, 0, 2), 
+                              y_pred_test_original.transpose(1, 0, 2),
                               os.path.join(save_path, 'predictions.png'))
 
 if __name__ == "__main__":
@@ -447,17 +466,18 @@ if __name__ == "__main__":
     data_loader = CarDataLoader("car_data")
     
     # Initialize LSTM model
-    input_size = 12  # Number of input features
+    input_size = 2  # Number of input features (x,y coordinates)
     hidden_size = 64
     output_size = 2  # x,y coordinates
+    prediction_steps = 5  # Number of future steps to predict
     
-    model = LSTM(input_size, hidden_size, output_size)
+    model = LSTM(input_size, hidden_size, output_size, prediction_steps)
     
-    # Train the model
+    # Train the model with a smaller learning rate
     train_model(model, data_loader, 
-                num_epochs=50,  # Increased epochs since we have early stopping
+                num_epochs=50,
                 batch_size=32,
-                learning_rate=0.01,
+                learning_rate=0.001,  # Reduced learning rate
                 lr_patience=5,
                 early_stopping_patience=10,
                 save_path='training_plots') 
