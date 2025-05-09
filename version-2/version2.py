@@ -12,31 +12,54 @@ from tqdm import tqdm
 
 # 1. LSTM CELL FROM SCRATCH
 class LSTMCell(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int):
+    def __init__(self, input_size, hidden_size):
         super(LSTMCell, self).__init__()
+        self.input_size = input_size
         self.hidden_size = hidden_size
-        concat_size = input_size + hidden_size
 
-        self.W_f = nn.Parameter(torch.randn(concat_size, hidden_size) * 0.1)
-        self.b_f = nn.Parameter(torch.zeros(hidden_size))
+        # Input gate weights
+        self.W_ii = nn.Parameter(torch.Tensor(input_size, hidden_size))
+        self.W_hi = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.b_i = nn.Parameter(torch.Tensor(hidden_size))
 
-        self.W_i = nn.Parameter(torch.randn(concat_size, hidden_size) * 0.1)
-        self.b_i = nn.Parameter(torch.zeros(hidden_size))
+        # Forget gate weights
+        self.W_if = nn.Parameter(torch.Tensor(input_size, hidden_size))
+        self.W_hf = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.b_f = nn.Parameter(torch.Tensor(hidden_size))
 
-        self.W_c = nn.Parameter(torch.randn(concat_size, hidden_size) * 0.1)
-        self.b_c = nn.Parameter(torch.zeros(hidden_size))
+        # Output gate weights
+        self.W_io = nn.Parameter(torch.Tensor(input_size, hidden_size))
+        self.W_ho = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.b_o = nn.Parameter(torch.Tensor(hidden_size))
 
-        self.W_o = nn.Parameter(torch.randn(concat_size, hidden_size) * 0.1)
-        self.b_o = nn.Parameter(torch.zeros(hidden_size))
+        # Cell candidate weights
+        self.W_ig = nn.Parameter(torch.Tensor(input_size, hidden_size))
+        self.W_hg = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.b_g = nn.Parameter(torch.Tensor(hidden_size))
 
-    def forward(self, x_t, h_prev, c_prev):
-        combined = torch.cat([x_t, h_prev], dim=1)
-        f_t = torch.sigmoid(combined @ self.W_f + self.b_f)
-        i_t = torch.sigmoid(combined @ self.W_i + self.b_i)
-        c_tilde = torch.tanh(combined @ self.W_c + self.b_c)
-        c_next = f_t * c_prev + i_t * c_tilde
-        o_t = torch.sigmoid(combined @ self.W_o + self.b_o)
+        self.init_weights()
+
+    def init_weights(self):
+        # Uniform initialization
+        for name, param in self.named_parameters():
+            if 'W_' in name:
+                nn.init.uniform_(param, -0.1, 0.1)
+            elif 'b_f' in name:
+                nn.init.ones_(param)  # Forget gate bias to 1
+            elif 'b_' in name:
+                nn.init.zeros_(param)
+
+    def forward(self, x, h_prev, c_prev):
+        # Gate computations with separate input and hidden weights
+        i_t = torch.sigmoid(x @ self.W_ii + h_prev @ self.W_hi + self.b_i)
+        f_t = torch.sigmoid(x @ self.W_if + h_prev @ self.W_hf + self.b_f)
+        o_t = torch.sigmoid(x @ self.W_io + h_prev @ self.W_ho + self.b_o)
+        g_t = torch.tanh(x @ self.W_ig + h_prev @ self.W_hg + self.b_g)
+
+        # Cell and hidden state updates
+        c_next = f_t * c_prev + i_t * g_t
         h_next = o_t * torch.tanh(c_next)
+
         return h_next, c_next
 
 # 2. SEQUENCE WRAPPER
@@ -80,20 +103,25 @@ class StackedLSTMSequenceModel(nn.Module):
 
 # 3. DATASET LOADER
 class CarTrajectoryDataset(Dataset):
-    def __init__(self, file_paths, input_steps=62, pred_steps=5, input_scaler=None, target_scaler=None):
+    def __init__(self, file_paths, input_steps=62, pred_steps=5, input_scaler=None, target_scaler=None, feature_indices=None):
         self.data = []
         self.input_scaler = input_scaler
         self.target_scaler = target_scaler
+        self.feature_indices = feature_indices
 
         for path in file_paths:
-            df = pd.read_csv(path).dropna().values  # Handles headers
+            df = pd.read_csv(path).dropna().values
             if df.shape[0] < input_steps + pred_steps:
                 continue
-            input_seq = df[:input_steps]
-            target_seq = df[input_steps:input_steps + pred_steps, :2]  # (x, y) only
+
+            if self.feature_indices:
+                input_seq = df[:input_steps, self.feature_indices]
+            else:
+                input_seq = df[:input_steps]  # All 12 features by default
+
+            target_seq = df[input_steps:input_steps + pred_steps, :2]  # (x, y)
             self.data.append((input_seq, target_seq))
 
-        # Apply scaling if scalers provided
         if self.input_scaler:
             all_inputs = np.vstack([x for x, _ in self.data])
             self.input_scaler.fit(all_inputs)
@@ -112,13 +140,17 @@ class CarTrajectoryDataset(Dataset):
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
 # 4. TRAINING + EVALUATION
-def train(model, train_loader, val_loader, num_epochs=20, lr=0.001, device='cuda'):
+def train(model, train_loader, val_loader, num_features, num_epochs=20, lr=0.001, device='cuda', patience=5, scheduler=None):
     model = model.to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     train_rmse_log = []
     val_rmse_log = []
+
+    best_val_rmse = float('inf')
+    best_model_state = None
+    patience_counter = 0
 
     for epoch in range(num_epochs):
         model.train()
@@ -137,14 +169,37 @@ def train(model, train_loader, val_loader, num_epochs=20, lr=0.001, device='cuda
             train_losses.append(loss.item())
 
         avg_train_rmse = np.sqrt(np.mean(train_losses))
-        val_rmse = evaluate(model, val_loader, device)
+        val_rmse = evaluate(model, val_loader, device, distance_threshold=1.0)
 
         train_rmse_log.append(avg_train_rmse)
         val_rmse_log.append(val_rmse)
 
         print(f"Train RMSE: {avg_train_rmse:.4f} | Val RMSE: {val_rmse:.4f}")
 
-    # Save training curve
+        # Scheduler step
+        if scheduler:
+            scheduler.step(val_rmse)
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Current learning rate: {current_lr:.6f}")
+
+        # Early stopping
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_model_state = model.state_dict()
+            patience_counter = 0
+            print("New best model found. Saving...")
+        else:
+            patience_counter += 1
+            print(f"No improvement. Patience: {patience_counter}/{patience}")
+
+        if patience_counter >= patience:
+            print("Early stopping triggered!")
+            break
+
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+    save_path = f"train_val_rmse_using_{num_features}_features.png"
+    # Save RMSE curve
     plt.figure()
     plt.plot(train_rmse_log, label='Train RMSE')
     plt.plot(val_rmse_log, label='Val RMSE')
@@ -153,12 +208,15 @@ def train(model, train_loader, val_loader, num_epochs=20, lr=0.001, device='cuda
     plt.title('Training & Validation RMSE')
     plt.legend()
     plt.grid(True)
-    plt.savefig("train_val_rmse.png")
+    plt.savefig(save_path)
     plt.close()
 
-def evaluate(model, dataloader, device='cuda'):
+
+def evaluate(model, dataloader, device='cuda', distance_threshold=1.0):
     model.eval()
     rmse_list = []
+    correct = 0
+    total = 0
     criterion = nn.MSELoss()
 
     with torch.no_grad():
@@ -167,10 +225,25 @@ def evaluate(model, dataloader, device='cuda'):
             y_batch = y_batch.to(device)
             output_seq = model(x_batch)
             pred_next_5 = output_seq[:, -5:]
+
             loss = criterion(pred_next_5, y_batch)
             rmse = torch.sqrt(loss)
             rmse_list.append(rmse.item())
-    return np.mean(rmse_list)
+
+            # Flatten batch and time dims for distance calculation
+            preds_flat = pred_next_5.reshape(-1, 2).cpu().numpy()
+            targets_flat = y_batch.reshape(-1, 2).cpu().numpy()
+
+            distances = np.linalg.norm(preds_flat - targets_flat, axis=1)
+            correct += np.sum(distances < distance_threshold)
+            total += len(distances)
+
+    avg_rmse = np.mean(rmse_list)
+    accuracy = correct / total if total > 0 else 0.0
+
+    print(f"Eval RMSE: {avg_rmse:.4f}")
+    print(f"% of predictions where distance between predicted and true (x, y) < {distance_threshold} unit): {accuracy*100:.2f}%")
+    return avg_rmse
 
 def test_and_collect_predictions(model, dataloader, device='cuda'):
     model.eval()
@@ -186,11 +259,11 @@ def test_and_collect_predictions(model, dataloader, device='cuda'):
 
     preds = torch.cat(all_preds, dim=0).numpy()
     targets = torch.cat(all_targets, dim=0).numpy()
-    # test_rmse = np.sqrt(np.mean((preds - targets) ** 2))
-    # print(f"Test RMSE: {test_rmse:.4f}")
+
     return preds, targets
 
-def plot_prediction(preds, targets, sample_idx=0, save_path="sample_prediction.png"):
+def plot_prediction(preds, targets, sample_idx, num_features):
+    save_path = f"sample_prediction_using_{num_features}_features.png"
     pred = preds[sample_idx]
     true = targets[sample_idx]
     plt.figure(figsize=(6, 6))
@@ -205,9 +278,32 @@ def plot_prediction(preds, targets, sample_idx=0, save_path="sample_prediction.p
     plt.savefig(save_path)
     plt.close()
 
+def plot_full_trajectory(preds, targets, num_features):
+    # Flatten across all samples and timesteps
+    pred_flat = preds.reshape(-1, 2)
+    target_flat = targets.reshape(-1, 2)
+    save_path = f"full_trajectory_comparison_using_{num_features}_features.png"
+    plt.figure(figsize=(8, 8))
+    plt.plot(target_flat[:, 0], target_flat[:, 1], label='Ground Truth', color='blue', alpha=0.7)
+    plt.plot(pred_flat[:, 0], pred_flat[:, 1], label='Predicted', color='red', alpha=0.7)
+    plt.title("Full Trajectory: Ground Truth vs Predicted")
+    plt.xlabel("X Coordinate")
+    plt.ylabel("Y Coordinate")
+    plt.legend()
+    plt.axis("equal")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("Using the following device: ", device)
+
+    feature_names = [
+        "Local_X", "Local_Y", "v_Vel", "v_Acc", "Space_Headway", "dis_cen",
+        "i_l", "i_r", "i_f", "dis_l", "dis_r", "dis_f"
+    ]
     
     # 1. Load file paths
     data_dir = '../car_data'  # <-- Replace with actual path if needed
@@ -217,12 +313,25 @@ def main():
     input_scaler = StandardScaler()
     target_scaler = StandardScaler()
 
+    # Choose input features: specify column indices (0 to 11)
+    # Example: [0, 1] for just (x, y); None for all 12 features
+    feature_indices = [0, 1] # e.g., [0, 1, 2, 3] for x, y, velocity, acceleration
+
     # 3. Create dataset and scale both inputs and targets
     full_dataset = CarTrajectoryDataset(
         file_list,
         input_scaler=input_scaler,
-        target_scaler=target_scaler
+        target_scaler=target_scaler,
+        feature_indices=feature_indices
     )
+    if feature_indices is None:
+        used_features = feature_names
+    else:
+        used_features = [feature_names[i] for i in feature_indices]
+
+    print(f"Using input features ({len(used_features)}): {used_features}")
+
+    input_dim = len(feature_indices) if feature_indices is not None else 12
 
     # 4. Split into train/val/test
     train_size = int(0.7 * len(full_dataset))
@@ -237,15 +346,37 @@ def main():
 
     # 6. Initialize model
     model = StackedLSTMSequenceModel(
-        input_size=12,
+        input_size=input_dim,
         hidden_size=64,
         output_size=2,
-        num_layers=3,       # Try 3 layers
-        dropout=0.3         # Apply dropout between them
+        num_layers=3,
+        dropout=0.3
+    )
+    num_features = len(used_features)
+
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=3,
+        verbose=True,
+        min_lr=1e-6
     )
 
     # 7. Train model
-    train(model, train_loader, val_loader, num_epochs=20, lr=0.001, device=device)
+    train(
+        model,
+        train_loader,
+        val_loader,
+        num_features=num_features,
+        num_epochs=50,
+        lr=0.001,
+        device=device,
+        patience=7,
+        scheduler=scheduler
+    )
+
 
     # 8. Test and get predictions (in normalized space)
     preds_scaled, targets_scaled = test_and_collect_predictions(model, test_loader, device=device)
@@ -253,13 +384,28 @@ def main():
     # 9. Inverse transform to original scale
     preds = target_scaler.inverse_transform(preds_scaled.reshape(-1, 2)).reshape(preds_scaled.shape)
     targets = target_scaler.inverse_transform(targets_scaled.reshape(-1, 2)).reshape(targets_scaled.shape)
-
-    true_rmse = np.sqrt(np.mean((preds - targets) ** 2))
-    print(f"True Test RMSE (original scale): {true_rmse:.4f}")
     
     # 10. Plot predictions
-    plot_prediction(preds, targets, sample_idx=0)
-  # Plot the first sample
+    sample_idx = 0
+    plot_prediction(preds, targets, sample_idx, num_features)
+
+    # 11. Compute and log metrics
+    true_rmse = np.sqrt(np.mean((preds - targets) ** 2))
+    distances = np.linalg.norm(preds.reshape(-1, 2) - targets.reshape(-1, 2), axis=1)
+    accuracy = np.mean(distances < 5.0) * 100
+
+    print(f"True Test RMSE (original scale): {true_rmse:.4f}")
+    print(f"Test Accuracy (within 5m): {accuracy:.2f}%")
+    
+    log_file = f"evaluation_results_using_{num_features}.txt"
+    # 11. Write metrics to file
+    with open(log_file, "w") as f:
+        f.write("Evaluation Metrics:\n")
+        f.write(f"Test RMSE (original scale): {true_rmse:.4f}\n")
+        f.write(f"Test Accuracy (within 5m): {accuracy:.2f}%\n")
+
+    plot_full_trajectory(preds, targets, save_path=f"full_trajectory_using_{num_features}_features.png")
+
 
 if __name__ == '__main__':
     main()
