@@ -81,25 +81,42 @@ class StackedLSTMSequenceModel(nn.Module):
 
         self.output_layer = nn.Linear(hidden_size, output_size)
 
-    def forward(self, input_seq):
+    def forward(self, input_seq, future_steps=5):
         batch_size, seq_len, _ = input_seq.size()
         h_t = [torch.zeros(batch_size, self.hidden_size, device=input_seq.device) for _ in range(self.num_layers)]
         c_t = [torch.zeros(batch_size, self.hidden_size, device=input_seq.device) for _ in range(self.num_layers)]
 
-        outputs = []
-
+        # Pass input sequence through LSTM
         for t in range(seq_len):
             x = input_seq[:, t, :]
             for i, lstm in enumerate(self.lstm_layers):
                 h_t[i], c_t[i] = lstm(x, h_t[i], c_t[i])
-                if i < self.num_layers - 1:  # Apply dropout to all but last
+                if i < self.num_layers - 1:
                     x = self.dropout_layers[i](h_t[i])
                 else:
                     x = h_t[i]
-            output = self.output_layer(x)
-            outputs.append(output.unsqueeze(1))
+
+        # Predict future steps autoregressively
+        outputs = []
+        x = input_seq[:, -1, :]  # Start with last input
+        for _ in range(future_steps):
+            for i, lstm in enumerate(self.lstm_layers):
+                h_t[i], c_t[i] = lstm(x, h_t[i], c_t[i])
+                if i < self.num_layers - 1:
+                    x = self.dropout_layers[i](h_t[i])
+                else:
+                    x = h_t[i]
+            out = self.output_layer(x)
+            outputs.append(out.unsqueeze(1))
+
+            # Use predicted (x, y) and fill rest of features with last input
+            x = torch.zeros_like(input_seq[:, 0, :])
+            x[:, :2] = out
+            if input_seq.shape[2] > 2:
+                x[:, 2:] = input_seq[:, -1, 2:]  # keep same other features
 
         return torch.cat(outputs, dim=1)
+
 
 # 3. DATASET LOADER
 class CarTrajectoryDataset(Dataset):
@@ -140,10 +157,9 @@ class CarTrajectoryDataset(Dataset):
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
 # 4. TRAINING + EVALUATION
-def train(model, train_loader, val_loader, num_features, num_epochs=20, lr=0.001, device='cuda', patience=5, scheduler=None):
+def train(model, train_loader, val_loader, num_features, distance_threshold, num_epochs=20, lr=0.001, device='cuda', patience=5, scheduler=None, optimizer=None):
     model = model.to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
 
     train_rmse_log = []
     val_rmse_log = []
@@ -161,15 +177,14 @@ def train(model, train_loader, val_loader, num_features, num_epochs=20, lr=0.001
             y_batch = y_batch.to(device)
 
             optimizer.zero_grad()
-            output_seq = model(x_batch)
-            pred_next_5 = output_seq[:, -5:]
-            loss = criterion(pred_next_5, y_batch)
+            output_seq = model(x_batch, future_steps=5)
+            loss = criterion(output_seq, y_batch)
             loss.backward()
             optimizer.step()
             train_losses.append(loss.item())
 
         avg_train_rmse = np.sqrt(np.mean(train_losses))
-        val_rmse = evaluate(model, val_loader, device, distance_threshold=1.0)
+        val_rmse = evaluate(model, val_loader, distance_threshold, device)
 
         train_rmse_log.append(avg_train_rmse)
         val_rmse_log.append(val_rmse)
@@ -212,7 +227,7 @@ def train(model, train_loader, val_loader, num_features, num_epochs=20, lr=0.001
     plt.close()
 
 
-def evaluate(model, dataloader, device='cuda', distance_threshold=1.0):
+def evaluate(model, dataloader, distance_threshold, device='cuda'):
     model.eval()
     rmse_list = []
     correct = 0
@@ -223,15 +238,13 @@ def evaluate(model, dataloader, device='cuda', distance_threshold=1.0):
         for x_batch, y_batch in dataloader:
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
-            output_seq = model(x_batch)
-            pred_next_5 = output_seq[:, -5:]
-
-            loss = criterion(pred_next_5, y_batch)
+            output_seq = model(x_batch, future_steps=5)
+            loss = criterion(output_seq, y_batch)
             rmse = torch.sqrt(loss)
             rmse_list.append(rmse.item())
 
             # Flatten batch and time dims for distance calculation
-            preds_flat = pred_next_5.reshape(-1, 2).cpu().numpy()
+            preds_flat = output_seq.reshape(-1, 2).cpu().numpy()
             targets_flat = y_batch.reshape(-1, 2).cpu().numpy()
 
             distances = np.linalg.norm(preds_flat - targets_flat, axis=1)
@@ -252,9 +265,8 @@ def test_and_collect_predictions(model, dataloader, device='cuda'):
     with torch.no_grad():
         for x_batch, y_batch in dataloader:
             x_batch = x_batch.to(device)
-            output_seq = model(x_batch)
-            pred_next_5 = output_seq[:, -5:]
-            all_preds.append(pred_next_5.cpu())
+            output_seq = model(x_batch, future_steps=5)
+            all_preds.append(output_seq.cpu())
             all_targets.append(y_batch)
 
     preds = torch.cat(all_preds, dim=0).numpy()
@@ -278,20 +290,36 @@ def plot_prediction(preds, targets, sample_idx, num_features):
     plt.savefig(save_path)
     plt.close()
 
-def plot_full_trajectory(preds, targets, num_features):
-    # Flatten across all samples and timesteps
-    pred_flat = preds.reshape(-1, 2)
-    target_flat = targets.reshape(-1, 2)
-    save_path = f"full_trajectory_comparison_using_{num_features}_features.png"
-    plt.figure(figsize=(8, 8))
-    plt.plot(target_flat[:, 0], target_flat[:, 1], label='Ground Truth', color='blue', alpha=0.7)
-    plt.plot(pred_flat[:, 0], pred_flat[:, 1], label='Predicted', color='red', alpha=0.7)
-    plt.title("Full Trajectory: Ground Truth vs Predicted")
-    plt.xlabel("X Coordinate")
+def plot_xy_over_time(preds, targets, num_features, sample_idx=0):
+    """
+    Plot predicted vs true X and Y coordinates over time for a single sample.
+    """
+    time_steps = np.arange(preds.shape[1])
+    pred_x = preds[sample_idx, :, 0]
+    pred_y = preds[sample_idx, :, 1]
+    true_x = targets[sample_idx, :, 0]
+    true_y = targets[sample_idx, :, 1]
+    save_path = f"xy_over_time_using_{num_features}_features.png"
+    plt.figure(figsize=(10, 6))
+
+    # X over time
+    plt.subplot(2, 1, 1)
+    plt.plot(time_steps, true_x, 'b-o', label='True X')
+    plt.plot(time_steps, pred_x, 'r--x', label='Pred X')
+    plt.ylabel("X Coordinate")
+    plt.title(f"Trajectory Over Time (Sample {sample_idx})")
+    plt.legend()
+    plt.grid(True)
+
+    # Y over time
+    plt.subplot(2, 1, 2)
+    plt.plot(time_steps, true_y, 'b-o', label='True Y')
+    plt.plot(time_steps, pred_y, 'r--x', label='Pred Y')
+    plt.xlabel("Timestep")
     plt.ylabel("Y Coordinate")
     plt.legend()
-    plt.axis("equal")
     plt.grid(True)
+
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
@@ -304,7 +332,7 @@ def main():
         "Local_X", "Local_Y", "v_Vel", "v_Acc", "Space_Headway", "dis_cen",
         "i_l", "i_r", "i_f", "dis_l", "dis_r", "dis_f"
     ]
-    
+    distance_threshold = 5.0
     # 1. Load file paths
     data_dir = '../car_data'  # <-- Replace with actual path if needed
     file_list = sorted(glob.glob(os.path.join(data_dir, '*.csv')))
@@ -360,7 +388,6 @@ def main():
         mode='min',
         factor=0.5,
         patience=3,
-        verbose=True,
         min_lr=1e-6
     )
 
@@ -369,14 +396,15 @@ def main():
         model,
         train_loader,
         val_loader,
-        num_features=num_features,
-        num_epochs=50,
+        num_features,
+        distance_threshold,
+        num_epochs=5,
         lr=0.001,
         device=device,
         patience=7,
-        scheduler=scheduler
+        scheduler=scheduler,
+        optimizer=optimizer
     )
-
 
     # 8. Test and get predictions (in normalized space)
     preds_scaled, targets_scaled = test_and_collect_predictions(model, test_loader, device=device)
@@ -392,10 +420,10 @@ def main():
     # 11. Compute and log metrics
     true_rmse = np.sqrt(np.mean((preds - targets) ** 2))
     distances = np.linalg.norm(preds.reshape(-1, 2) - targets.reshape(-1, 2), axis=1)
-    accuracy = np.mean(distances < 5.0) * 100
+    accuracy = np.mean(distances < distance_threshold) * 100
 
     print(f"True Test RMSE (original scale): {true_rmse:.4f}")
-    print(f"Test Accuracy (within 5m): {accuracy:.2f}%")
+    print(f"Test Accuracy (within {distance_threshold} m): {accuracy:.2f}%")
     
     log_file = f"evaluation_results_using_{num_features}.txt"
     # 11. Write metrics to file
@@ -404,8 +432,7 @@ def main():
         f.write(f"Test RMSE (original scale): {true_rmse:.4f}\n")
         f.write(f"Test Accuracy (within 5m): {accuracy:.2f}%\n")
 
-    plot_full_trajectory(preds, targets, save_path=f"full_trajectory_using_{num_features}_features.png")
-
+    plot_xy_over_time(preds, targets, num_features, sample_idx=0)
 
 if __name__ == '__main__':
     main()
