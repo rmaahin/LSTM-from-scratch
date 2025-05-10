@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+torch.backends.cudnn.benchmark = True
 
 # 1. LSTM CELL FROM SCRATCH
 class LSTMCell(nn.Module):
@@ -343,7 +344,7 @@ def main():
 
     # Choose input features: specify column indices (0 to 11)
     # Example: [0, 1] for just (x, y); None for all 12 features
-    feature_indices = [0, 1] # e.g., [0, 1, 2, 3] for x, y, velocity, acceleration
+    feature_indices = None # e.g., [0, 1, 2, 3] for x, y, velocity, acceleration
 
     # 3. Create dataset and scale both inputs and targets
     full_dataset = CarTrajectoryDataset(
@@ -368,9 +369,9 @@ def main():
     train_set, val_set, test_set = random_split(full_dataset, [train_size, val_size, test_size])
 
     # 5. Create DataLoaders
-    train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=32)
-    test_loader = DataLoader(test_set, batch_size=32)
+    train_loader = DataLoader(train_set, batch_size=32, shuffle=True, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=32, pin_memory=True)
+    test_loader = DataLoader(test_set, batch_size=32, pin_memory=True)
 
     # 6. Initialize model
     model = StackedLSTMSequenceModel(
@@ -398,7 +399,7 @@ def main():
         val_loader,
         num_features,
         distance_threshold,
-        num_epochs=5,
+        num_epochs=100,
         lr=0.001,
         device=device,
         patience=7,
