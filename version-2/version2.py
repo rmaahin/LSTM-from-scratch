@@ -344,7 +344,7 @@ def main():
 
     # Choose input features: specify column indices (0 to 11)
     # Example: [0, 1] for just (x, y); None for all 12 features
-    feature_indices = None # e.g., [0, 1, 2, 3] for x, y, velocity, acceleration
+    feature_indices = [0, 1] # e.g., [0, 1, 2, 3] for x, y, velocity, acceleration
 
     # 3. Create dataset and scale both inputs and targets
     full_dataset = CarTrajectoryDataset(
